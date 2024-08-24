@@ -1,0 +1,16 @@
+{
+  "name": "@mediasemantics/character-api-client",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "version": "1.0.0",
+  "description": "Standard HTML client module for the Character API.",
+  "main": "character-api-client.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["character api", "character", "character animation", "TTS", "virtual people"],
+  "author": "Media Semantics, Inc.",
+  "license": "MIT"
+}

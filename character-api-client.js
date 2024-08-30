@@ -8,8 +8,8 @@ function CharacterApiClient(divid, params) {
     var that = this;
     if (!params.animateEndpoint) return console.error("missing parameter animateEndpoint");
 
-    var version;
-    var messageid;
+    var CLIENT_VERSION = "1.0";
+    var featureWarning;
     var fade = true;            // Whether we fade-in the opening scene - true by default but can be overridden in params
     var playQueue = [];         // Queue of [0,id,line] or [1,{do,say,audio,...}]
     var playCur = null;         // Currently playing playQueue item, or null
@@ -102,9 +102,13 @@ function CharacterApiClient(divid, params) {
     function setupScene() {
         var div = document.getElementById(divid);
         if (!div) return console.error("no div "+divid);
-        // If not specified, use size of the div
+
+        // The height can be specified as a style, a property, or both.
         if (params.width === undefined) params.width = div.offsetWidth;
         if (params.height === undefined) params.height = div.offsetHeight;
+        if (div.style.width == undefined) div.style.width = params.width + "px";
+        if (div.style.height == undefined) div.style.height = params.height + "px";
+        
         var cx = params.width;
         var cy = params.height;
         var cx2 = cx * clientScale;
@@ -479,10 +483,13 @@ function CharacterApiClient(divid, params) {
         loadPhase = 0;
         
         if (say && containsActualSpeech(say)) {
-            if (audio && lipsync)
+            if (audio && lipsync) {
+                addedParams = addedParams + '&lipsync=' +  encodeURIComponent(lipsync);
                 speakRecorded(addedParams, audio, lipsync);
-            else 
+            }
+            else {
                 speakTTS(addedParams);
+            }
         }
         else {
             audioBuffer = "na"; // sentinel value exists during loading and indicates animation without audio
@@ -515,7 +522,6 @@ function CharacterApiClient(divid, params) {
     }
 
     function speakRecorded(addedParams, audioURL, lipsync) {
-        addedParams = addedParams + '&lipsync=' +  encodeURIComponent(lipsync);
         // load the audio, but hold it
         if (audioContext) {
             var xhr = new XMLHttpRequest();
@@ -605,7 +611,9 @@ function CharacterApiClient(divid, params) {
         loadPhase = 1;
     
         // Populate idle cache
-        if (addedParams.indexOf("&idle=") != -1) {
+        if (addedParams.indexOf("&do=idle") != -1) {
+            var dataURL = makeGetURL(addedParams + "&type=data");
+            var imageURL = makeGetURL(addedParams + "&type=image");
             idleCache[dataURL] = animData;
             idleCache[imageURL] = texture;
         }
@@ -638,7 +646,7 @@ function CharacterApiClient(divid, params) {
                     if (!secondaryTextures) return; // e.g. reset                    
                     
                     // populate idle cache
-                    if (addedParams.indexOf("&idle=") != -1)
+                    if (addedParams.indexOf("&do=idle") != -1)
                         idleCache[textureURL] = secondaryTextures[key];
                     
                     testSecondaryTexturesLoaded();
@@ -722,6 +730,13 @@ function CharacterApiClient(divid, params) {
     }
 
     function getItStarted(startAudio) {
+        // version check
+        if (animData.requireClient) {
+            var breaking = parseInt(animData.requireClient.split(".")[0]);
+            var feature = parseInt(animData.requireClient.split(".")[1]);
+            if (breaking > parseInt(CLIENT_VERSION.split(".")[0])) return console.error("character requires newer client");
+            else if (breaking == parseInt(CLIENT_VERSION.split(".")[0]) && feature > parseInt(CLIENT_VERSION.split(".")[1]) && !featureWarning) {console.warn("character requires newer client to be fully functional"); featureWarning = true;}
+        }
         // render the first frame and start animation loop
         loading = false;
         showTranscript();

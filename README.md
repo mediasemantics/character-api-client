@@ -72,6 +72,7 @@ The required parameters are as follows:
 | animateEndpoint | The base url of the animate endpoint that you will build using the [Character API Reference Implementation](https://github.com/mediasemantics/charapi).  |
 | catalogEndpoint | Similarly, this is the base url of your catalog endpoint.
 
+
 ## Reacting to events
 
 Listen to events on the div object:

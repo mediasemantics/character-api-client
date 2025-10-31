@@ -70,7 +70,7 @@ The required parameters are as follows:
 | height          | Height of the div.                                                                                         |
 | character       | The id of the character - see [character catalog](https://mediasemantics.com/characters.html).             |
 | animateEndpoint | The base url of the animate endpoint that you will build using the [Character API Reference Implementation](https://github.com/mediasemantics/charapi).  |
-| catalogEndpoint | Similarly, this is the base url of your catalog endpoint.
+| catalogEndpoint | Similarly, this is the base url of your catalog endpoint.                                                  |
 
 
 ## Reacting to events

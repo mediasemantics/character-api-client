@@ -4,7 +4,7 @@
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Standard HTML client module for the Character API.",
   "main": "character-api-client.js",
   "scripts": {

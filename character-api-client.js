@@ -8,7 +8,7 @@ function CharacterApiClient(divid, params) {
     var that = this;
     if (!params.animateEndpoint) return console.error("missing parameter animateEndpoint");
 
-    var CLIENT_VERSION = "1.0";
+    var CLIENT_VERSION = "1.1";
     var featureWarning;
     var fade = true;            // Whether we fade-in the opening scene - true by default but can be overridden in params
     var playQueue = [];         // Queue of [0,id,line] or [1,{do,say,audio,...}]
@@ -343,7 +343,7 @@ function CharacterApiClient(divid, params) {
     }
     var audioBuffer;                     // Audio buffer being loaded
     var audioSource;                     // Audio source, per character
-    var loadPhase;                       // 0 = not loaded, 1 = audio/data/texture loaded, 2 = secondary textures loaded
+    var loadPhase;                       // 0 = not loaded, 1 = audio/data/texture loaded, 2 = secondary textures loaded, 3 = load error
 
     // State
     var initialState = "";
@@ -363,7 +363,6 @@ function CharacterApiClient(divid, params) {
     var starting;                   // True if we are starting an animation - overlaps animating
     var executeCallback;            // What to call on execute() return, i.e. when entire animation is complete
     var rafid;                      // Defined only when at least one character is animating - otherwise we stop the RAF (game) loop
-    var atLeastOneLoadError;        // We use this to stop idle after first load error
     var inFade;                     // True if we are fading in or out char
 
     // Idle
@@ -477,6 +476,8 @@ function CharacterApiClient(divid, params) {
         addedParams = addedParams + '&do=' + (tag||"");
         addedParams = addedParams + '&say=' + encodeURIComponent(say||"");
 
+        if (audioSource) audioSource.stop();
+        audioSource = null;
         audioBuffer = null;
         animData = null;
         texture = null;
@@ -883,15 +884,28 @@ function CharacterApiClient(divid, params) {
                                     src = texture;
                                 
                                 var process = recipe[i][7]||0;
+                                var toosmall = animData.swayProcess == 2 /*body*/ && animData.density == 1;
                                 if (process >= 11 && process < 20) updateRandomWalk(process);
-                                if (process == 1 || process == 2) {
+                                if (process == 1 || process == 2 || (!toosmall && (process == 4 || process == 5))) {
                                     var o = updateTransform(src, recipe, i);
-                                    var process = recipe[i][7];
                                     ctx.drawImage(canvasTransformDst[process-1],
                                         0, 0,
                                         recipe[i][4], recipe[i][5],
                                         recipe[i][0] + o.x, recipe[i][1] + o.y,
                                         recipe[i][4], recipe[i][5]);
+                                }
+                                else if (process == 5 && toosmall) {
+                                    var o = updateTransform(src, recipe, i); // retain eyeball
+                                }
+                                else if (process == 4 && toosmall) {
+                                    var o = updateTransform(src, recipe, i);
+                                    var ctx2 = canvasTransformDst[5-1].getContext("2d");
+                                    ctx2.drawImage(canvasTransformDst[4-1], 0, 0); // draw mask into eyeball
+                                    ctx.drawImage(canvasTransformDst[5-1],
+                                        0, 0,
+                                        recipe[i][4], recipe[i][5],
+                                        recipe[i][0] + o.x / 2, recipe[i][1] + o.y / 2,
+                                        recipe[i][4] / 2, recipe[i][5] / 2);
                                 }
                                 else if (params.format == "png") {
                                     // png characters replacement overlays with alpha need to first clear bits they replace e.g. hands up
@@ -971,9 +985,8 @@ function CharacterApiClient(divid, params) {
     }
 
     function animateFailed() {
-        console.error("service error");
-        atLeastOneLoadError = true;
         loading = false;
+        loadPhase = 3;
         animateComplete();
     }
 
@@ -993,10 +1006,10 @@ function CharacterApiClient(divid, params) {
         }
         else {
             if (audioSource) {
-                audioSource = null;
+                // Audio can overhang animation in some cases
                 timeSinceLastAudioStopped = Date.now();
             }
-            if (params.saveState) initialState = animData.finalState;
+            if (params.saveState && animData) initialState = animData.finalState;
             if (executeCallback) {
                 var t = executeCallback;
                 executeCallback = null;
@@ -1016,30 +1029,34 @@ function CharacterApiClient(divid, params) {
     }
 
     function controlRandomWalkSuppression(animData, frame) {
-        // Are layers with random process present in the next 6 frames? If so, suppressRandom = true, else false.
-        var present = true;
+        // Are hands controlled in the next 10 frames? If so, suppressRandom = true, else false.
         try {
-            for (var d = 0; d < 6; d++) {
+			suppressRandom = false;
+            for (var d = 0; d < 10; d++) {
                 var frameTest = frame + d;
                 if (animData.frames[frameTest][1] == -1 || stopping && animData.frames[frameTest][1]) break; // stop searching when we run out of frames
                 var framerec = animData.frames[frameTest];
                 var recipe = animData.recipes[framerec[0]];
-                var found = false;
+				var count = 0;
                 for (var i = 0; i < recipe.length; i++) {
                     var process = recipe[i][7]||0;
-                    if (process >= 11 && process < 20) {found = true; break;}
+                    if (process >= 11 && process < 20) count++;
                 }
-                if (!found) {present = false; break;}
+                if (count < 2) {
+                    suppressRandom = true;
+                    //console.log("Hand controlled at " + frame + "+" + d);
+					break;
+				}
             }
         } catch(e) {}
-        suppressRandom = !present;
     }
 
     function updateRandomWalk(process) {
         var n = process - 10;
         // drive rapidly to frame 1
         if (suppressRandom) {
-            if (random[n].frame > 1) random[n].frame = Math.round(random[n].frame/2);
+            if (random[n].frame > 1) random[n].frame = Math.max(0, random[n].frame - 2);
+            //console.log("Suppressing "+process+" "+random[n].frame);
             random[n].count = 0;
             random[n].inc = 0;
             return;
@@ -1063,14 +1080,14 @@ function CharacterApiClient(divid, params) {
         var xSrcImage = recipe[i][0];
         var ySrcImage = recipe[i][1];
         var process = recipe[i][7];
-        var rb = process == 1 ? animData.mouthBendRadius : (process == 2 || animData.jawBendRadius != undefined ? animData.jawBendRadius : 0);
-        var rt = process == 1 ? animData.mouthTwistRadius : (process == 2 || animData.jawTwistRadius != undefined ? animData.jawTwistRadius : 0);
+        var rb = (process == 4 || process == 5) ? animData.eyeBendRadius : animData.mouthBendRadius;
+        var rt = (process == 4 || process == 5) ? animData.eyeTwistRadius : animData.mouthTwistRadius;
         var bend = - recipe[i][8] / 180 * Math.PI;
         var twist = recipe[i][9] / 180 * Math.PI;
         var side = recipe[i][10] / 180 * Math.PI;
         side += twist * animData.twistToSide;
         bend += side * (animData.sideToBend||0);
-        var sideLength = animData.sideLength;//*2;
+        var sideLength = (process == 4 || process == 5) ? animData.sideLengthEye : animData.sideLength;
         var lowerJawDisplacement = animData.lowerJawDisplacement;
         var lowerJaw = recipe[i][8];
         var shoulders = recipe[i][8];
@@ -1086,7 +1103,7 @@ function CharacterApiClient(divid, params) {
             addXForm(1, 0, 0, 1, 0, sideLength, m);
         }
         if (x || y) {
-            addXForm(1, 0, 0, 1, x, y, m);
+            addXForm(1, 0, 0, 1, -x, -y, m);
         }
         // Extract the portion of the image we want to a new temp context and get its bits as the source
         if (!canvasTransformSrc[process-1]) {
@@ -1107,26 +1124,38 @@ function CharacterApiClient(divid, params) {
         // Return the image displacement
         var deltax = 0;
         var deltay = 0;
-        if (process == 1 || animData.jawBendRadius != undefined) {
+        if (process == 1 || process == 4 || process == 5) {
             // Assume same size for destination image as for src, and compute where the origin will fall
-            var xDstImage = Math.floor(xSrcImage + rt * Math.sin(twist));
-            var yDstImage = Math.floor(ySrcImage - rb * Math.sin(bend));
+            var xDstImage = Math.round(xSrcImage + rt * Math.sin(twist));
+            var yDstImage = Math.round(ySrcImage - rb * Math.sin(bend));
             deltax = xDstImage - xSrcImage;
             deltay = yDstImage - ySrcImage;
-            // Setup feathering
+            deltax = Math.floor(deltax * 0.6); // a fudge factor to compensate for shift in mouth/eye within moving overlay
+            if (animData.swayProcess == 2 && animData.density == 1) {
+                deltax = Math.round(deltax / 2) * 2;
+                deltay = Math.round(deltay / 2) * 2;
+            }
+            // Setup feathering (mouth)
             var a = width / 2;
             var b = height / 2;
-            var fudge = Math.round(width/40) - 1;
-            var xp = width - 5 - fudge; // 5 pixel feathering
-            var xpp = width - fudge; // but don't consider very edge pixels, at least in hi res
+            var feathering = animData.swayProcess == 2 ? 4 : ((animData.density||2)+1)*2;
+            var xp = width - feathering;
+            var xpp = width;
             var vp = (xp-a)*(xp-a)/(a*a);
             var vpp = (xpp-a)*(xpp-a)/(a*a);
+            // Setup feathering (eyes)
+            var aeye = width/2 / 2;
+            var beye = height / 2;
+            var xpeye = width/2 - feathering;
+            var xppeye = width/2;
+            var vpeye = (xpeye-aeye)*(xpeye-aeye)/(aeye*aeye);
+            var vppeye = (xppeye-aeye)*(xppeye-aeye)/(aeye*aeye);
             // Main loop
             var xDstGlobal,yDstGlobal,xSrcGlobalZ,ySrcGlobalZ,xSrcGlobal,ySrcGlobal,xSrc,ySrc,x1Src,x2Src,y1Src,y2Src,offSrc1,offSrc2,offSrc3,offSrc4,rint,gint,bint,aint;
             var offDst = 0;
             for (var yDst = 0; yDst < height; yDst++) {
                 for (var xDst = 0; xDst < width; xDst++) {
-                    xDstGlobal = xDst + 0.001 - width/2 + deltax ;
+                    xDstGlobal = xDst + 0.001 - width/2 + deltax;
                     yDstGlobal = yDst + 0.001 - height/2 + deltay;
                     // z-rotate on an elliptic sphere with radius rb, rt
                     xSrcGlobalZ = rt * Math.sin(Math.asin(xDstGlobal/rt) - twist);
@@ -1154,33 +1183,72 @@ function CharacterApiClient(divid, params) {
                     rint = Math.round((x2Src-xSrc)*(y2Src-ySrc) * source.data[offSrc1+0] + (xSrc-x1Src)*(y2Src-ySrc) * source.data[offSrc2+0] + (x2Src-xSrc)*(ySrc-y1Src) * source.data[offSrc3+0] + (xSrc-x1Src)*(ySrc-y1Src) * source.data[offSrc4+0]);
                     gint = Math.round((x2Src-xSrc)*(y2Src-ySrc) * source.data[offSrc1+1] + (xSrc-x1Src)*(y2Src-ySrc) * source.data[offSrc2+1] + (x2Src-xSrc)*(ySrc-y1Src) * source.data[offSrc3+1] + (xSrc-x1Src)*(ySrc-y1Src) * source.data[offSrc4+1]);
                     bint = Math.round((x2Src-xSrc)*(y2Src-ySrc) * source.data[offSrc1+2] + (xSrc-x1Src)*(y2Src-ySrc) * source.data[offSrc2+2] + (x2Src-xSrc)*(ySrc-y1Src) * source.data[offSrc3+2] + (xSrc-x1Src)*(ySrc-y1Src) * source.data[offSrc4+2]);
-                    var alpha;
-                    if (process == 1) {
-                        var v = (xDst-a)*(xDst-a)/(a*a) + (yDst-b)*(yDst-b)/(b*b);
+                    aint = Math.round((x2Src-xSrc)*(y2Src-ySrc) * source.data[offSrc1+3] + (xSrc-x1Src)*(y2Src-ySrc) * source.data[offSrc2+3] + (x2Src-xSrc)*(ySrc-y1Src) * source.data[offSrc3+3] + (xSrc-x1Src)*(ySrc-y1Src) * source.data[offSrc4+3]);
+                    var alpha, v;
+                    if (process == 1) { // mouth
+                        v = (xDst-a)*(xDst-a)/(a*a) + (yDst-b)*(yDst-b)/(b*b);
                         if (v > vpp) 
                             alpha = 0;
                         else if (v >= vp && v <= vpp) 
                             alpha = Math.round(255 * ((Math.sqrt(vpp) - Math.sqrt(v))/(Math.sqrt(vpp) - Math.sqrt(vp))));
                         else
-                            alpha = 255;
+                            alpha = aint;
                     }
-                    else if (process == 2) {
-                        alpha = Math.round((x2Src-xSrc)*(y2Src-ySrc) * source.data[offSrc1+3] + (xSrc-x1Src)*(y2Src-ySrc) * source.data[offSrc2+3] + (x2Src-xSrc)*(ySrc-y1Src) * source.data[offSrc3+3] + (xSrc-x1Src)*(ySrc-y1Src) * source.data[offSrc4+3]);
-                        if (alpha < 222) alpha = 0; else alpha = 255;
-                        if (yDst < height/10)
-                            alpha = Math.min(alpha, yDst /  (height/10) * 255);
+                    else if (process == 4) { //eyemask
+                        if (xDst <= width/2)
+                            v = (xDst-aeye)*(xDst-aeye)/(aeye*aeye) + (yDst-beye)*(yDst-beye)/(beye*beye);
+                        else 
+                            v = ((xDst-width/2)-aeye)*((xDst-width/2)-aeye)/(aeye*aeye) + (yDst-beye)*(yDst-beye)/(beye*beye);
+                        if (v > vppeye) 
+                            alpha = 0;
+                        else if (v >= vpeye && v <= vppeye) 
+                            alpha = Math.round(255 * ((Math.sqrt(vppeye) - Math.sqrt(v))/(Math.sqrt(vppeye) - Math.sqrt(vpeye))));
+                        else
+                            alpha = aint;
                     }
-                    else {
-                        alpha = 255;
+                    else if (process == 5) { // eyeball
+                        alpha = aint;
                     }
-                    target.data[offDst] = rint; offDst++;
+                    target.data[offDst] = rint/*/2*/; offDst++;
                     target.data[offDst] = gint; offDst++;
                     target.data[offDst] = bint; offDst++;
-                    target.data[offDst] = alpha; offDst++;
+                    target.data[offDst] = alpha/*/2*/; offDst++;
                 }
             }
+            if (process == 4) { // eyemask - also convolve the alpha on the eye cutout for more natural shadow
+                var temp = new Uint8ClampedArray(target.data);
+                var conv = animData.density;
+                var offDst = 0;
+                for (var yDst = 0; yDst < height; yDst++) {
+					var s = "";
+                    for (var xDst = 0; xDst < width; xDst++) {
+                        if (xDst <= width/2)
+                            v = (xDst-aeye)*(xDst-aeye)/(aeye*aeye) + (yDst-beye)*(yDst-beye)/(beye*beye);
+                        else 
+                            v = ((xDst-width/2)-aeye)*((xDst-width/2)-aeye)/(aeye*aeye) + (yDst-beye)*(yDst-beye)/(beye*beye);
+                        if (v < vpeye) {
+                            aint = target.data[offDst+3];
+                            if (aint < 200) {
+                                var n = 0;
+                                var t = 0;
+                                for (var yRun = -conv; yRun < conv; yRun++) {
+                                    for (var xRun = -conv; xRun < conv; xRun++) {
+                                        var off = offDst + yRun*width*4 + xRun*4;
+                                        t += target.data[off + 3];
+                                        n++;
+                                    }
+                                }
+                                alpha = Math.max(aint, Math.round(Math.min(t/n, 200) * 0.75));
+                                temp[offDst+3] = alpha; 
+                            }
+                        }
+                        offDst += 4;
+                    }
+                }
+                target.data.set(temp);
+            }
         }
-        else if (process == 2) {
+        else if (process == 2) { //  jaw
             // Main loop
             var xSrc,ySrc,x1Src,x2Src,y1Src,y2Src,offSrc1,offSrc2,offSrc3,offSrc4,rint,gint,bint,aint;
             var offDst = 0;
@@ -1211,7 +1279,7 @@ function CharacterApiClient(divid, params) {
                     if (yDst < height/10)
                         alpha = Math.min(alpha, yDst /  (height/10) * 255);
                     target.data[offDst] = rint; offDst++;
-                    target.data[offDst] = gint; offDst++;
+                    target.data[offDst] = gint/*/2*/; offDst++;
                     target.data[offDst] = bint; offDst++;
                     target.data[offDst] = alpha; offDst++;
                 }
@@ -1375,7 +1443,7 @@ function CharacterApiClient(divid, params) {
         timeSinceLastAction += elapsed;
         timeSinceLastBlink += elapsed;
 
-        if (loaded && !loading && !animating && !playShield && !atLeastOneLoadError) {
+        if (loaded && !loading && !animating && !playShield && loadPhase != 3) {
             if (timeSinceLastAction > 1500 + Math.random() * 3500) {  // no more than 5 seconds with no action whatsoever
                 timeSinceLastAction = 0;
                 var idles = getIdles();

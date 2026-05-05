@@ -6,9 +6,9 @@ export default CharacterApiClient;
 
 function CharacterApiClient(divid, params) {
     var that = this;
-    if (!params.animateEndpoint) return console.error("missing parameter animateEndpoint");
+    if (!params.animateEndpoint) return console.error("Character API missing parameter animateEndpoint");
 
-    var CLIENT_VERSION = "1.1";
+    var CLIENT_VERSION = "1.2";
     var featureWarning;
     var fade = true;            // Whether we fade-in the opening scene - true by default but can be overridden in params
     var playQueue = [];         // Queue of [0,id,line] or [1,{do,say,audio,...}]
@@ -59,7 +59,7 @@ function CharacterApiClient(divid, params) {
     }
     
     function loadCatalog() {
-        if (!params.catalogEndpoint) return console.error("missing parameter catalogEndpoint");
+        if (!params.catalogEndpoint) return console.error("Character API missing parameter catalogEndpoint");
         xhrCatalog = new XMLHttpRequest();
         xhrCatalog.onload = function() {
             try {
@@ -67,13 +67,13 @@ function CharacterApiClient(divid, params) {
                 xhrCatalog = null;
             } catch (e) {
                 xhrCatalog = null;
-                console.error("cannot load catalog");
+                console.error("Character API cannot load catalog");
             }
             completeParamsFromCatalog(o);
             catalogLoaded();
         };
         xhrCatalog.onerror = function() {
-            console.error("cannot load catalog");
+            console.error("Character API cannot load catalog");
             xhrCatalog = null;
         }
         xhrCatalog.open("GET", params.catalogEndpoint, true); 
@@ -101,7 +101,7 @@ function CharacterApiClient(divid, params) {
 
     function setupScene() {
         var div = document.getElementById(divid);
-        if (!div) return console.error("no div "+divid);
+        if (!div) return console.error("Character API no div "+divid);
 
         // The height can be specified as a style, a property, or both.
         if (params.width === undefined) params.width = div.offsetWidth;
@@ -124,6 +124,7 @@ function CharacterApiClient(divid, params) {
     }
 
     function setupCharacter() {
+        t1 = Date.now();
         execute("", "", null, null, false, null); // first load results in characterLoaded
     }
 
@@ -206,24 +207,224 @@ function CharacterApiClient(divid, params) {
     };
 
     this.dynamicPlay = function(o) {
+        //console.log("dynamicPlay");
         if (audioContext) audioContext.resume();
         if (o) {
             // Process the object
             if (typeof o.say == "number") o.say = o.say.toString();
             else if (typeof o.say != "string") o.say = "";
-            if (!loading && !animating && !stopping) {
-                playCur = o;
-                execute(o.do, o.say, o.audio, o.lipsync, false, onPlayDone);
+            // Regular
+            if (!o.streaming) {
+                if (streaming) {
+                    console.warn("Character API ignoring new dynamicPlay call during streaming");
+                    return;
+                }
+                if (!loading && !animating && !stopping) {
+                    playCur = o;
+                    t1 = Date.now();
+                    execute(o.do, o.say, o.audio, o.lipsync, false, onPlayDone);
+                }
+                else {
+                    if (idling) {
+                        //console.log("stopping idle");
+                        stopAll(); // accelerate any running idle when we begin to play
+                    }
+                    if (!loading && animating && stopping && (o.do || o.say || o.audio)) {
+                        //console.log("loading while stopping");
+                        t1 = Date.now();
+                        execute(o.do, o.say, o.audio, o.lipsync, false, onPlayDone); // safe to begin loading next if previous is stopping
+                    }
+                    else {
+                        //console.log("queueing");
+                        playQueue.push(o);
+                        // All queued messages are preload candidates
+                        preloadExecute(o.do, o.say, o.audio, o.lipsync);
+                    }
+                }
             }
+            // Streaming
             else {
-                if (!playCur && playQueue.length == 0)
-                    stopAll(); // accelerate any running idle when we begin to play
-                playQueue.push(o);
-                // All queued messages are preload candidates
-                preloadExecute(o.do, o.say, o.audio, o.lipsync);
+                // case where updates come too fast and we are still processing the last one
+                if (processingStreamingCall) {
+					streamingWaitingForProcessing = o;
+					//console.log("streaming call while processing streaming call - deferring");
+                    // we could already have been waiting, in which case we'd end up dropping one or more dynamicPlay({streaming:true}) requests, but that's okay - it's cumulative
+                    return;
+                }
+                if (playQueue.length > 0) {
+                    console.warn("Character API unsupported mix of streaming and non-streaming calls");
+                    return;
+                }
+                processingStreamingCall = true;
+                if (!streaming) {
+                    // Note that a streaming call can interrupt another streaming call, but only if you stop() the previous call first. This
+                    // effectively converts the previous call to a stopping idle.
+                    if (idling)
+                        stopAll(); // accelerate any running idle when we begin to play - it doesn't hurt to stop a stopping idle again.
+                    streamingFirst = true;
+                    streaming = true;
+                    if (animating) {
+                        //console.log("streaming call loading even as previous animation (idle or stopped stream) is stopping")	
+                        streamingAfterAbortedIdle = true; // see onIdleComplete
+                    }
+                    playCur = o;
+                }
+                else {
+                    streamingFirst = false;
+					if (!isAContinuation(o)) {
+						console.warn("Character API ignoring incompatible dynamicPlay call during streaming");
+                        processingStreamingCall = false;
+						return;
+					}
+                }
+                if (o.lipsync) streamingLipsync = o.lipsync;
+                if (o.animation) streamingAnimation = o.animation;
+                if (o.final) streamingFinal = true;
+                // Process new buffers
+                for (var i = streamingBuffers.length; i < o.audio.length; i++) {
+                    var src = audioContext.createBufferSource();
+                    src.buffer = o.audio[i];
+                    src.connect(gainNode);
+                    if (!streamingAudioStarted || streamingPaused) {
+                        //console.log("adding")
+                        streamingBuffers.push({node:src, time:0, duration:o.audio[i].duration});
+                    }
+                    else {
+                        //console.log("adding and playing")
+                        var startTime = streamingBuffers[streamingBuffers.length - 1].time + streamingBuffers[streamingBuffers.length - 1].duration;
+                        if (startTime < audioContext.currentTime) console.warn('Character API audio arrived ' + (audioContext.currentTime - startTime) + 's too late');
+                        src.start(startTime);
+                        streamingBuffers.push({node:src, time:startTime, duration:o.audio[i].duration});
+                    }
+                }
+                // All 3 branches end up calling streamingCallProcessed()
+                if (streamingFirst)
+                    execute(o.do, o.say, null, null, false, onStreamingPlayDone); // streamingCallProcessed called from testSecondaryTexturesLoaded()
+                else if (streamingLipsync)
+                    loadStreamingAnimation();  // streamingCallProcessed called on xhr return
+                else
+                    streamingCallProcessed();
             }
         }
-        else document.getElementById(divid).dispatchEvent(createEvent("playComplete")); // always get one of these
+    }
+
+	function isAContinuation(o) {
+		// Given a streaming dynamicPlay call, is it a continuation of the current one? We just check for monotonically increasing (or stable)
+		// amount of information - noting that lipsync stream is normally compressed.
+		if (o.lipsync) {  
+			if (o.lipsync.length >= streamingLipsync.length)
+				return true;
+			//else console.log(o.lipsync.length + " < " + streamingLipsync.length);
+		}	
+		if (o.animation) { 
+			if (frameCount(o.animation) >= (streamingAnimation ? frameCount(streamingAnimation) : 0)) 
+				return true;
+			//else console.log(frameCount(o.animation) + " < " + (streamingAnimation ? frameCount(streamingAnimation) : 0));
+		}
+		return false;
+	}
+	
+    function pauseStreamingAudio() {
+        var timeStop = audioContext.currentTime;
+        for (var i = 0; i < streamingBuffers.length; i++) {
+            // Stop the audio buffer that is currently playing and any beyond that, but replace them with unscheduled (time == 0) nodes
+            if (timeStop > streamingBuffers[i].time && timeStop < streamingBuffers[i].time + streamingBuffers[i].duration || timeStop < streamingBuffers[i].time) {
+                streamingBuffers[i].node.stop();
+                if (timeStop > streamingBuffers[i].time && timeStop < streamingBuffers[i].time + streamingBuffers[i].duration) // save the resume offset for the first buffer
+                    streamingResumeOffset = timeStop - streamingBuffers[i].time;
+                var src = audioContext.createBufferSource();
+                src.buffer = streamingBuffers[i].node.buffer;
+                src.connect(gainNode);
+                streamingBuffers[i].node = src;
+                streamingBuffers[i].time = 0; 
+            }
+        }
+    }
+
+    function streamingCallProcessed() {
+        if (!streaming) {console.warn('Character API unexpected'); return;}
+        processingStreamingCall = false;
+        // Save our ticket for a free continuation
+		if (streamingFirst)
+			streamingContinuation = animDataNext.continuation;
+		else
+			streamingContinuation = streamingAnimation.continuation;
+        if (streamingFirst) {
+	        // Give client our "streaming info" on first call - this allows the continuation calls to be pushed to the client, or to its server-side streaming partner - we receive results via animation param in dynamicPlay, instead of lipsync
+            var params = makeGetURL("&streaming=true&level=" + (level ? Math.max(1,level-1) : 3) + "&continuation=" + encodeURIComponent(animDataNext.continuation)).split('?')[1];
+            document.getElementById(divid).dispatchEvent(createEvent("streamingInfo", params));
+        }
+        else if (streamingAudioStarted) {
+            // We can directly switch the current animData for the new one only because continuations guarantee that all previously-seen frames remain the same.
+            animData = streamingAnimation;
+        }
+        else {
+            // animDataNext is not transferred to animData until getItStarted() - to allow previous idle to finish.
+            animDataNext = streamingAnimation; 
+        }
+        // Opportunity to start audio for the first time if we have 1/2 sec of audio or this is the final call
+        if (!animating && !streamingAudioStarted && (streamingFinal || streamingBuffers.length > 0 && frameCount(animDataNext) > animDataNext.fps / 2)) {
+            //console.log("starting stream after sufficient frames");
+            getItStarted(true); // called once, sets streamingAudioStarted
+        }
+        // Opportunity to restart paused audio, if we have buffered 1 sec OR this is the final call
+        else if (streamingAudioStarted && streamingPaused && (streamingFinal || frameCount(animData) - streamingFramesWhenPaused > animData.fps)) {
+            var time = audioContext.currentTime;
+            //console.log("restarting buffers after streaming pause");
+            for (var i = 0; i < streamingBuffers.length; i++) {
+                if (streamingBuffers[i].time != 0) continue;
+                var offset = 0; // the first unscheduled buffer gets played from the offset where we left off
+                if (streamingResumeOffset) {
+                    offset = streamingResumeOffset;
+                    streamingResumeOffset = 0;
+                }
+                streamingBuffers[i].time = time;
+                streamingBuffers[i].node.start(time, offset);
+                time += streamingBuffers[i].duration;
+            }
+            streamingPaused = false;
+            streamingFramesWhenPaused = 0;
+            then = Date.now();
+        }
+        // Restart waiting call if any
+        if (streamingWaitingForProcessing) {
+            var temp = streamingWaitingForProcessing;
+            streamingWaitingForProcessing = null;
+            setTimeout(function() {
+				//console.log("processing deferred buffers");
+                that.dynamicPlay(temp);
+            }, 0);
+        }
+    }
+
+    function frameCount(ad) {
+        for (var i = 0; i < ad.frames.length; i++) {
+            if (ad.frames[i][1] == -1) break;
+        }
+        return i;
+    }
+
+    function loadStreamingAnimation() {
+        // We have some more lipsync and need to convert it to a new animData
+        var addedParams = '&streaming=true';
+        addedParams += '&lipsync=' + encodeURIComponent(streamingLipsync);
+        addedParams += "&continuation=" + encodeURIComponent(streamingContinuation);
+        if (streamingFinal) addedParams += '&final=true';
+        addedParams += '&level=' + (level ? Math.max(1,level-1) : 3);
+        var dataURL = makeGetURL(addedParams + "&type=data");
+        xhrStreaming = new XMLHttpRequest();
+        xhrStreaming.open('GET', dataURL, true);
+        xhrStreaming.onload = function () {
+            try {
+                streamingAnimation = JSON.parse(xhrStreaming.response);
+            } catch(e) {animateFailed();}
+			xhrStreaming = null;
+            streamingCallProcessed();
+        }
+        xhrStreaming.onerror = function() {
+			resetStreaming();
+		}
+        xhrStreaming.send();
     }
 
     // Like dynamicPlay, but merely attempts to preload all the files required
@@ -257,27 +458,83 @@ function CharacterApiClient(divid, params) {
     };
 
     function onPlayDone() {
+        animData = null;
+        texture = null;
+        secondaryTextures = {};
         if (playCur && !apogee) onEmbeddedCommand({type:'apogee'});
+        if (loadedWhileStopping) {
+            //console.log("starting new play after play stop complete");
+            loadedWhileStopping = false;
+            // Complete the transition to new execute
+            executeCallback = executeCallbackNext;
+            executeCallbackNext = null;
+            getItStarted(!!audioBuffer);
+            return;
+        }
         if (playQueue.length > 0) {
             playCur = playQueue.shift();
+            //console.log("playing from queue");
+            t1 = Date.now();
             execute(playCur.do, playCur.say, playCur.audio, playCur.lipsync, false, onPlayDone);
         }
         else {
-            if (playCur) { // we also get here onIdleComplete
+            if (playCur) {
                 playCur = null;
                 document.getElementById(divid).dispatchEvent(createEvent("playComplete")); // i.e. all plays complete - we are idle
             }
         }
     }
 
+    function onStreamingPlayDone() {
+        //console.log("streaming play done");
+        // similar to onPlayDone            
+        animData = null;
+        animDataNext = null;
+        texture = null;
+        secondaryTextures = {};
+        resetStreaming();
+        if (playCur && !apogee) onEmbeddedCommand({type:'apogee'});
+        playCur = null;
+        document.getElementById(divid).dispatchEvent(createEvent("playComplete"));
+    }
+
     function onIdleComplete() {
-        // if a play happens while running an idle automation, we just queue it up
-        onPlayDone();
+        //console.log("onIdleComplete");
+        animData = null;
+        texture = null;
+        secondaryTextures = {};
+        if (loadedWhileStopping) {
+            //console.log("starting new play after idle complete");
+            loadedWhileStopping = false;
+            // Complete the transition to new execute
+            executeCallback = executeCallbackNext;
+            executeCallbackNext = null;
+            getItStarted(!!audioBuffer);
+        }
+        else if (streamingAfterAbortedIdle) {
+            streamingAfterAbortedIdle = false;
+            executeCallback = executeCallbackNext;
+            executeCallbackNext = null;
+            // A chance to get it started - could happen if idle takes a long time to stop - recall also that an aborted stream is made to look like a stopping idle
+            if (!streamingAudioStarted && animDataNext && animDataNext.frames.length > animDataNext.fps / 2) {
+                //console.log("starting new stream after sufficient frames and idle complete");
+                getItStarted(true);
+            }
+        }
     }
 
     this.stop = function() {
         stopAll();
         playQueue = [];
+    }
+
+    this.attention = function() {
+        stopAll();
+        playQueue = [];
+        attention = true;
+    }
+    this.clearAttention = function() {
+        attention = false;
     }
 
     this.volume = function() {
@@ -289,6 +546,7 @@ function CharacterApiClient(divid, params) {
     }
 
     function onEmbeddedCommand(cmd) {
+        if (!playCur) return;
         // Often 'apogee' is often the only embedded command used. It is used to support actions in high level scripts, e.g. [look-right and next].
         if (cmd && cmd.type == 'apogee') {
             if (playCur.and == "run") 
@@ -321,7 +579,7 @@ function CharacterApiClient(divid, params) {
         var url = params.animateEndpoint;
         // Additional parameters from the caller, e.g. character
         for (var key in params) {
-            if (key && key != "endpoint" && key != "fade" && key != "idleType" && key != "autoplay" && key != "playShield" && key != "preload" && key != "saveState" && key != "idleData" && key != "clientScale" && key != "sway" && key != "breath") // minus the parameters for charapiclient
+            if (key && key != "endpoint" && key != "fade" && key != "idleType" && key != "autoplay" && key != "playShield" && key != "preload" && key != "saveState" && key != "idleData" && key != "clientScale" && key != "sway" && key != "breath" && key != "animateEndpoint" && key != "catalogEndpoint") // minus the parameters for charapiclient
                 url += (url.indexOf("?") == -1 ? "?" : "&") + key + "=" + encodeURIComponent(params[key]);
         }
         // Additional params added by charapiclient.js, e.g. texture, with
@@ -343,27 +601,37 @@ function CharacterApiClient(divid, params) {
     }
     var audioBuffer;                     // Audio buffer being loaded
     var audioSource;                     // Audio source, per character
-    var loadPhase;                       // 0 = not loaded, 1 = audio/data/texture loaded, 2 = secondary textures loaded, 3 = load error
 
     // State
     var initialState = "";
 
     // Loading
+    var audioXhr = null;              // Audio xhr
+    var animDataXhr = null;           // Animation data xhr
     var texture;                      // Latest loaded texture - we try to keep it down to eyes, mouth - the leftovers
     var animData;                     // animData to match texture.
     var secondaryTextures = {};       // e.g. {LookDownLeft:Texture}
+    var loadPhase;                    // 0 = not loaded, 1 = audio/data/texture loaded, 2 = secondary textures loaded, 3 = load error
     var defaultTexture;               // The initial texture is also the secondary texture named 'default'
+    var textureNext;                  // Loading texture
+    var animDataNext;                 // Loading animData
+    var secondaryTexturesNext = {};   // Loading secondaryTextures
+    var loadedWhileStopping = false;  // True if play occurs while last idle still ending
 
     // Running
     var loaded;                     // True if default frame is loaded for a given character
     var loading;                    // True if we are loading a new animation - does not overlap animating
+    var idling;                     // Qualifies loading/animating - if true then the loading/running animation is an idle animation
     var animating;                  // True if a character is animating
     var frame;                      // Current frame of animation
+    var lastRealFrame;              // Used in buffering
     var stopping;                   // True if we are stopping an animation - overlaps animating
     var starting;                   // True if we are starting an animation - overlaps animating
     var executeCallback;            // What to call on execute() return, i.e. when entire animation is complete
+    var executeCallbackNext;        // Next executeCallback, when overlapping the new execute with the stopping one    
     var rafid;                      // Defined only when at least one character is animating - otherwise we stop the RAF (game) loop
     var inFade;                     // True if we are fading in or out char
+    var then;                       // Time of last animation
 
     // Idle
     var idleTimeout;
@@ -374,9 +642,9 @@ function CharacterApiClient(divid, params) {
     var idleCache = {};                 // Even though idle resources are typically in browser cache, we prefer to keep them in memory, as they are needed repeatedly    
 
     // Settle feature
-    var timeSinceLastAudioStopped = 0;   // Used to detect if and how much we should settle for
-    var settleTimeout;              // If non-0, we are animating true but are delaying slightly at the beginning to prevent back-to-back audio
-    var delayTimeout;               // If non-0, we are animating true but are delaying audio slightly for leadingSilence
+    var timeSinceLastMouthMovement = 0; // Used to detect if and how much we should settle for
+    var settleTimeout;                  // If non-0, we are animating true but are delaying slightly at the beginning to prevent back-to-back audio
+    var delayTimeout;                   // If non-0, we are animating true but are delaying audio slightly for leadingSilence
 
     // Preloading
     var preload = true;         // Master switch (a param normally)
@@ -399,7 +667,29 @@ function CharacterApiClient(divid, params) {
     
     // Misc
     var stagedTranscript;
-    
+    var attention = false;                  // Set by attention() - suppresses/alters idle activity while listening or "at attention"
+    var level = undefined;                  // The level of random variation we are requesting - starts at 1 - we actively preload until level 3, then this goes to 0. Sent to the server if non-0, or when streaming as &level.
+    var levelTarget = [];                   // The list of textures needed for this level - comes to us in the animData from the previous request
+    var allsecondary = false;               // Certain characters put all art in secondary textures beyond the initial default texture
+    var t1,t2,t3,t4;
+
+    // Streaming
+    var streaming = false;                  // Is this a streaming call i.e. dynamicPlay with streaming:true
+    var streamingAfterAbortedIdle = false;  // True if stream call occurs while last idle still playing
+    var streamingBuffers = [];              // All streaming audio buffers
+    var streamingLipsync = "";              // Latest streaming lipsync
+	var xhrStreaming = null;                // See loadStreamingAnimation
+    var streamingAnimation = null;          // Latest streaming animation (lipsync OR animation can be supplied on subsequent dynamicPlay)
+    var streamingContinuation = null;       // Let's us call animate repeatedly with increasing phoneme data      
+    var streamingFirst = false;             // Is this the first dynamic streaming call
+    var streamingFinal = false;             // Is it the last
+    var streamingAudioStarted = false;      // Has streaming audio started
+    var processingStreamingCall = false;    // Are we in a streaming dynamicPlay call when another dynamicPlay occurs
+    var streamingWaitingForProcessing = null; // If so then this is the last pending streaming dynamicPlay object
+    var streamingPaused = false;            // Is streaming paused for buffering
+    var streamingFramesWhenPaused = 0;      // If streaming is paused, how many frames did animation have, total
+    var streamingResumeOffset = 0;          // If paused for buffering and we get new audio, the first buffer with time == 0 gets resumed at this offset
+
     function resetInnerVars() {
         gainNode = null;
         audioBuffer = null;
@@ -407,19 +697,26 @@ function CharacterApiClient(divid, params) {
 
         initialState = "";
 
+        audioXhr = null;
+        animDataXhr = null;
         texture = undefined;
         animData = undefined;
         secondaryTextures = {};
+        textureNext = undefined;
+        animDataNext = undefined;
+        secondaryTexturesNext = {};
         loadPhase = 0;
         defaultTexture = undefined;
 
         loaded = undefined;
         loading = undefined;
         animating = undefined;
+        idling = undefined;
         frame = undefined;
         stopping = undefined;
         starting = undefined
         executeCallback = undefined;
+        executeCallbackNext = undefined;
         idleTimeout = null;
         rafid = null;
         inFade = false;
@@ -430,7 +727,7 @@ function CharacterApiClient(divid, params) {
         timeSinceLastBlink = undefined;
         lastIdle = "";
 
-        timeSinceLastAudioStopped = 0;
+        timeSinceLastMouthMovement = 0;
         settleTimeout = undefined;
         delayTimeout = undefined;
 
@@ -442,51 +739,114 @@ function CharacterApiClient(divid, params) {
         
         random = undefined;
         suppressRandom = false;
+
+        attention = false;
+        level = undefined;
+        levelTarget = [];
+        allsecondary = false;
+        resetStreaming();
+    }
+
+    function cancelAnyLoads() {
+        if (audioXhr) { 
+            audioXhr.abort(); 
+            audioXhr = null; 
+        }                                                     
+        if (animDataXhr) { 
+            animDataXhr.abort(); 
+            animDataXhr = null; 
+        }
+        if (textureNext) { 
+            textureNext.onload = null; 
+            textureNext.onerror = null; 
+        }
+        if (secondaryTexturesNext) {
+            for (var key in secondaryTexturesNext) {
+                var img = secondaryTexturesNext[key];
+                if (img) { img.onload = null; img.onerror = null; }
+            }                                                                                                                   
+        }
+    }
+
+    function resetStreaming() {
+        streaming = false;
+        streamingBuffers = [];
+        streamingLipsync = "";
+        streamingAnimation = null;
+        streamingContinuation = null;
+        streamingFirst = false;
+        streamingFinal = false;
+        streamingAudioStarted = false;
+        streamingWaitingForProcessing = null;
+        processingStreamingCall = false;
+        streamingPaused = false;
+        streamingFramesWhenPaused = 0;
+        streamingResumeOffset = 0
+        streamingAfterAbortedIdle = false;
+		if (xhrStreaming) xhrStreaming.abort();
+		xhrStreaming = null;
     }
 
     function execute(tag, say, audio, lipsync, idle, callback) {
         // Shortcut out in common case where there is no action or audio, i.e. the author could have placed behavior here but did not.
-        if (!tag && !say && !audio && loaded) {
+        if (!tag && !say && !audio && !streaming && loaded) {
             onEmbeddedCommand({type:'apogee'}); // however this could be a legit Look At User and Next - this handles it with no server involvement
             if (callback) callback();
             return;
         }
-        
         apogee = false;        
         
-        if (loading || animating) {
-            console.error("internal error"); // execute called on a character while animating that character
+        if (loading || (animating && !stopping)) {
+            console.error("Character API internal error"); // execute called on a character while animating that character
             return;
         }
-
-        if (random && random.length > 0 && !idle) suppressRandom = true; // immediately drive any random controllers to 0 (idles are assumed not to start with an immediate hand action)
+        if (!streaming) loading = true;
 
         if (say) stageTranscript(transcriptFromText(say));
 
-        executeCallback = callback;
+        if (animating && stopping)
+            executeCallbackNext = callback;	
+        else
+            executeCallback = callback;
 
-        stopping = false;
-        loading = true;
-        animating = false;
+        idling = idle;
 
         var addedParams = "";
-
-        secondaryTextures = {};
         if (saveState) addedParams += "&initialstate=" + initialState;
-        addedParams = addedParams + '&do=' + (tag||"");
-        addedParams = addedParams + '&say=' + encodeURIComponent(say||"");
+        if (!idling && !streaming && level > 0)
+            addedParams += "&level=" + Math.max(1,level-1); // limit complexity of early plays        
 
         if (audioSource) audioSource.stop();
         audioSource = null;
         audioBuffer = null;
-        animData = null;
-        texture = null;
+
+        if (!idling) attention = false;
+
+        if (random && random.length > 0 && !idling) suppressRandom = true; // immediately drive any random controllers to 0 (idles are assumed not to start with an immediate hand action)
+
+        addedParams = addedParams + '&do=' + (tag||"");
+        addedParams = addedParams + '&say=' + encodeURIComponent(say||"");
+
+        animDataNext = null;
+        textureNext = null;
+        secondaryTexturesNext = {};
         loadPhase = 0;
         
-        if (say && containsActualSpeech(say)) {
-            if (audio && lipsync) {
+        if (say && containsActualSpeech(say) || streaming) {
+            if (streaming) {
+                // First streaming call like any other for the most part
+				addedParams = addedParams + '&streaming=true';
+                addedParams = addedParams + '&level=' + (level ? Math.max(1,level-1) : 3); // clamped to 3 even when fully leveled
+                // We NEED a level of 1, 2, or 3 for streaming to force reported secondary textures. Or else new length could be filled with animation requiring new textures.
+            }
+            else if (audio && lipsync) {
                 addedParams = addedParams + '&lipsync=' +  encodeURIComponent(lipsync);
-                speakRecorded(addedParams, audio, lipsync);
+                if (audio instanceof AudioBuffer) {
+                    audioBuffer = audio;
+                }
+                else {
+                    speakRecorded(addedParams, audio);
+                }
             }
             else {
                 speakTTS(addedParams);
@@ -522,7 +882,7 @@ function CharacterApiClient(divid, params) {
         return s;
     }
 
-    function speakRecorded(addedParams, audioURL, lipsync) {
+    function speakRecorded(addedParams, audioURL) {
         // load the audio, but hold it
         if (audioContext) {
             var xhr = new XMLHttpRequest();
@@ -547,11 +907,12 @@ function CharacterApiClient(divid, params) {
     function speakTTS(addedParams) {
         var audioURL = makeGetURL(addedParams + "&type=audio");
         if (audioContext) {
-            var xhr = new XMLHttpRequest();
-            xhr.open('GET', audioURL, true);
-            xhr.responseType = 'arraybuffer';
-            xhr.onload = function () {
-                audioContext.decodeAudioData(xhr.response, function (buffer) {
+            audioXhr = new XMLHttpRequest();
+            //console.log("loading audio " + audioURL + (preloaded.indexOf(audioURL) > -1 ? " (PRELOADED)" : ""));
+            audioXhr.open('GET', audioURL, true);
+            audioXhr.responseType = 'arraybuffer';
+            audioXhr.onload = function () {
+                audioContext.decodeAudioData(audioXhr.response, function (buffer) {
                     audioBuffer = buffer;
                     if (preloaded.indexOf(audioURL) == -1) preloaded.push(audioURL);
                     testAudioDataImageLoaded(addedParams);
@@ -559,8 +920,8 @@ function CharacterApiClient(divid, params) {
                     animateFailed();
                 });
             };
-            xhr.onerror = function() {animateFailed();}
-            xhr.send();
+            audioXhr.onerror = function() {animateFailed();}
+            audioXhr.send();
         }
         if (preloaded.indexOf(audioURL) == -1) preloaded.push(audioURL);
     }
@@ -571,33 +932,36 @@ function CharacterApiClient(divid, params) {
         
         // Idle cache shortcut
         if (idleCache[dataURL] && idleCache[imageURL]) {
-            animData = idleCache[dataURL];
-            texture = idleCache[imageURL];
+            animDataNext = idleCache[dataURL];
+            textureNext = idleCache[imageURL];
             testAudioDataImageLoaded(addedParams);
             return;
         }
         
         // Load the data
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', dataURL, true);
-        xhr.onload = function () {
-            
+        animDataXhr = new XMLHttpRequest();
+        animDataXhr.open('GET', dataURL, true);
+        //console.log("loading data " + dataURL + (preloaded.indexOf(dataURL) > -1 ? " (PRELOADED)" : ""));
+        animDataXhr.onload = function () {
             try {
-                animData = JSON.parse(xhr.response);
+                animDataNext = JSON.parse(animDataXhr.response);
                 testAudioDataImageLoaded(addedParams);
             } catch(e) {animateFailed();}
         }
-        xhr.onerror = function() {animateFailed();}
-        xhr.send();
-        
+        animDataXhr.onerror = function() {animateFailed();}
+        animDataXhr.send();
+
         // Load the image
-        texture = new Image();
-        texture.crossOrigin = "Anonymous";
-        texture.onload = function() {
-            testAudioDataImageLoaded(addedParams);
-        };
-        texture.onerror = function() {animateFailed();}
-        texture.src = imageURL;
+        if (!allsecondary) {
+            textureNext = new Image();
+            textureNext.crossOrigin = "Anonymous";
+            textureNext.onload = function() {
+                testAudioDataImageLoaded(addedParams);
+            };
+            textureNext.onerror = function() {animateFailed();}
+            //console.log("loading image " + imageURL + (preloaded.indexOf(imageURL) > -1 ? " (PRELOADED)" : ""));
+            textureNext.src = imageURL;
+        }
         
         // No need to preload these
         if (imageURL && preloaded.indexOf(imageURL) == -1) preloaded.push(imageURL);
@@ -605,18 +969,20 @@ function CharacterApiClient(divid, params) {
     }
     
     function testAudioDataImageLoaded(addedParams) {
-        if (loadPhase == 0 && audioBuffer && animData && texture && texture.complete) audioDataImageLoaded(addedParams);
+        if (loadPhase == 0 && (audioBuffer || streaming) && animDataNext && (allsecondary || (textureNext && textureNext.complete))) audioDataImageLoaded(addedParams);
     }
-    
+
     function audioDataImageLoaded(addedParams) {
+        t2 = Date.now();
+        //console.log("time to load audio/data/image: "+(t2-t1));        
         loadPhase = 1;
     
         // Populate idle cache
         if (addedParams.indexOf("&do=idle") != -1) {
             var dataURL = makeGetURL(addedParams + "&type=data");
             var imageURL = makeGetURL(addedParams + "&type=image");
-            idleCache[dataURL] = animData;
-            idleCache[imageURL] = texture;
+            idleCache[dataURL] = animDataNext;
+            idleCache[imageURL] = textureNext;
         }
         
         recordSecondaryTextures();
@@ -625,35 +991,36 @@ function CharacterApiClient(divid, params) {
     }
 
     function recordSecondaryTextures() {
-        secondaryTextures = {};
-        for (var i = 0; i < animData.textures.length; i++) {
-            if (animData.textures[i] != "default")
-                secondaryTextures[animData.textures[i]] = null;
+        secondaryTexturesNext = {};
+        for (var i = 0; i < animDataNext.textures.length; i++) {
+            if (animDataNext.textures[i] != "default")
+                secondaryTexturesNext[animDataNext.textures[i]] = null;
         }
     }
     
     function loadSecondaryTextures(addedParams) {
-        for (var key in secondaryTextures) {
+        for (var key in secondaryTexturesNext) {
             var textureURL = makeGetURL("&texture=" + key + "&type=image");
             
             // idle cache shortcut
             if (idleCache[textureURL]) {
-                secondaryTextures[key] = idleCache[textureURL];
+                secondaryTexturesNext[key] = idleCache[textureURL];
             }
             else {
-                secondaryTextures[key] = new Image();
-                secondaryTextures[key].crossOrigin = "Anonymous";
-                secondaryTextures[key].onload = function () {
-                    if (!secondaryTextures) return; // e.g. reset                    
+                secondaryTexturesNext[key] = new Image();
+                secondaryTexturesNext[key].crossOrigin = "Anonymous";
+                secondaryTexturesNext[key].onload = function () {
+                    if (!secondaryTexturesNext) return; // e.g. reset                    
                     
                     // populate idle cache
                     if (addedParams.indexOf("&do=idle") != -1)
-                        idleCache[textureURL] = secondaryTextures[key];
+                        idleCache[textureURL] = secondaryTexturesNext[key];
                     
                     testSecondaryTexturesLoaded();
                 };
-                secondaryTextures[key].onerror = function() {animateFailed();}
-                secondaryTextures[key].src = textureURL;
+                secondaryTexturesNext[key].onerror = function() {animateFailed();}
+                //console.log("loading secondary " + textureURL + (preloaded.indexOf(textureURL) > -1 ? " (PRELOADED)" : ""));
+                secondaryTexturesNext[key].src = textureURL;
                 if (textureURL && preloaded.indexOf(textureURL) == -1) preloaded.push(textureURL);
             }
         }
@@ -662,13 +1029,26 @@ function CharacterApiClient(divid, params) {
     function testSecondaryTexturesLoaded() {
         if (loadPhase != 1) return;
         var allLoaded = true;
-        for (var key in secondaryTextures)
-            if (!secondaryTextures[key].complete) {allLoaded = false; break;}
+        for (var key in secondaryTexturesNext)
+            if (!secondaryTexturesNext[key].complete) {allLoaded = false; break;}
         if (allLoaded) {
             if (audioBuffer == "na") // end use as sentinel
                 audioBuffer = null;
             loadPhase = 2;
-            getItStarted(!!audioBuffer);
+			loading = false;
+            t3 = Date.now();
+            //console.log("time to load secondaries: "+(t3-t2));
+            if (streaming) {
+                // if streaming, we are done - we'll wait for subsequent dynamicPlay's with sufficient audio data to actually start
+                streamingCallProcessed();
+            }
+            else if (animating) {
+                //console.log("play loaded but still stopping animation");
+                loadedWhileStopping = true;
+            }
+            else {
+                getItStarted(!!audioBuffer);
+            }
         }
     }
     
@@ -676,8 +1056,10 @@ function CharacterApiClient(divid, params) {
     function preloadExecute(tag, say, audio, lipsync) {
         var addedParams = "";
         if (saveState) addedParams += "&initialstate=" + initialState;
-        addedParams = addedParams + '&do=' + encodeURIComponent(tag||"");
-        addedParams = addedParams + '&say=' + encodeURIComponent(say||"");
+        if (!idling && level > 0)
+            addedParams += "&level=" + Math.max(1,level-1);
+        addedParams += '&do=' + encodeURIComponent(tag||"");
+        addedParams += '&say=' + encodeURIComponent(say||"");
         if (say && audio && lipsync) {
             addedParams = addedParams + '&lipsync=' +  encodeURIComponent(lipsync);
         }
@@ -686,21 +1068,67 @@ function CharacterApiClient(divid, params) {
             preloadHelper(audioURL);
         }
         var imageURL = makeGetURL(addedParams + "&type=image");
-        preloadHelper(imageURL);
+        if (!allsecondary) preloadHelper(imageURL);
         var dataURL = makeGetURL(addedParams + "&type=data");
         preloadHelper(dataURL);
     }
 
+    function preloadLevelTextures(ad) {
+        // level starts at 1
+        levelTarget = [];
+        if (level == 1 && ad.level1) levelTarget = ad.level1;
+        else if (level == 2 && ad.level2) levelTarget = ad.level2;
+        else if (level == 3 && ad.level3) levelTarget = ad.level3;
+		if (levelTarget.length == 0) return;
+        for (var i = 0; i < levelTarget.length; i++) {
+            var textureURL = makeGetURL("&texture=" + levelTarget[i] + "&type=image");
+            preloadHelper(textureURL);
+        }
+        checkLevelUp();
+    }
+
+    function checkLevelUp() {
+        if (level == 0) return;
+        if (!levelTarget || levelTarget.length == 0) {
+            //console.log("character has no leveling");
+            level = 0;
+            return;
+        }
+        if (streaming) return; // must leave level stable for duration of a stream
+        if (playQueue.length > 0) return; // if anything queued need to avoid requesting at a higher level than was queued
+        var allLoaded = true;
+        for (var i = 0; i < levelTarget.length; i++) {
+            var url = makeGetURL("&texture=" + levelTarget[i] + "&type=image");
+            if (preloaded.indexOf(url) == -1)
+                allLoaded = false;
+        }
+        if (allLoaded) {
+            if (level == 1 || level == 2) {
+                level++;
+                //console.log("level "+level);
+            }
+            else if (level == 3) {
+                level = 0;
+                //console.log("no more leveling");
+            }
+        }
+    }
+
     function preloadHelper(url) {
-        if (preloaded.indexOf(url) == -1 && preloadQueue.indexOf(url) == -1)
+        if (preloaded.indexOf(url) == -1 && preloadQueue.indexOf(url) == -1) {
             preloadQueue.push(url);
-        if (!preloadTimeout && preload)
-            preloadTimeout = setTimeout(preloadSomeMore, 100);
+            if (!preloadTimeout && preload)
+                preloadTimeout = setTimeout(preloadSomeMore, 100);
+        }
     }
 
     function preloadSomeMore() {
         preloadTimeout = null;
         if (preloading || preloadQueue.length == 0) return;
+        if (streaming) { // cases where we shouldn't preload to keep the bandwidth clear
+            preloadTimeout = setTimeout(preloadSomeMore, 100);
+            return;
+        }
         preloading = preloadQueue.shift();
         //console.log("preloading "+preloading)
         var xhr = new XMLHttpRequest();
@@ -719,6 +1147,8 @@ function CharacterApiClient(divid, params) {
                 }
                 preloading = null;
             }
+            // leveling
+            checkLevelUp();
             // restart in a bit
             if (preloadQueue.length > 0) {
                 preloadTimeout = setTimeout(preloadSomeMore, 100);
@@ -731,29 +1161,42 @@ function CharacterApiClient(divid, params) {
     }
 
     function getItStarted(startAudio) {
+        //console.log("getItStarted "+startAudio);
         // version check
-        if (animData.requireClient) {
-            var breaking = parseInt(animData.requireClient.split(".")[0]);
-            var feature = parseInt(animData.requireClient.split(".")[1]);
-            if (breaking > parseInt(CLIENT_VERSION.split(".")[0])) return console.error("character requires newer client");
-            else if (breaking == parseInt(CLIENT_VERSION.split(".")[0]) && feature > parseInt(CLIENT_VERSION.split(".")[1]) && !featureWarning) {console.warn("character requires newer client to be fully functional"); featureWarning = true;}
+        if (animDataNext.requireClient) {
+            var breaking = parseInt(animDataNext.requireClient.split(".")[0]);
+            var feature = parseInt(animDataNext.requireClient.split(".")[1]);
+            if (breaking > parseInt(CLIENT_VERSION.split(".")[0])) return console.error("Character API character requires newer client");
+            else if (breaking == parseInt(CLIENT_VERSION.split(".")[0]) && feature > parseInt(CLIENT_VERSION.split(".")[1]) && !featureWarning) {console.warn("Character API character requires newer client to be fully functional"); featureWarning = true;}
         }
         // render the first frame and start animation loop
-        loading = false;
         showTranscript();
-		// case where we are stopping before we got started
-		if (stopping) {
-		    animateComplete();
-    		return;
-		}
         animating = true;
         starting = true;
+
+        // Tranfer from next to actual - from here on we use the actual
+        animData = animDataNext;
+        animDataNext = null;
+        texture = textureNext;
+        textureNext = null;
+        secondaryTextures = secondaryTexturesNext;
+        secondaryTexturesNext = {};
+
+        // Leveling
+        if (level === undefined && animData.level1) level = 1;
+        if (level > 0) preloadLevelTextures(animData);
+        
+        // If the first load comes in with allsecondary=true then we know that there is no need for the image going forward
+        if (animData.allsecondary) allsecondary = true;
 
         // Settling feature - establish a minimum time between successive animations - mostly to prevent back to back audio - because we are so good at preloading
         if (settleTimeout) {clearTimeout(settleTimeout); settleTimeout = 0;}
         var t = Date.now();
-        if (t - timeSinceLastAudioStopped < 333) {
-            settleTimeout = setTimeout(onSettleComplete.bind(null, startAudio), 333 - (t - timeSinceLastAudioStopped));
+        if (!streaming && t - timeSinceLastMouthMovement < 750) {
+            var delay = 750 - (t - timeSinceLastMouthMovement);
+            //console.log("settle delay: " + delay);
+            settleTimeout = setTimeout(onSettleComplete.bind(null, startAudio), delay);
+			// both the animation and the audio are delayed, but animating=true, starting=true
         }
         else {
             getItStartedCheckDelay(startAudio);
@@ -768,6 +1211,8 @@ function CharacterApiClient(divid, params) {
     function getItStartedCheckDelay(startAudio) {
         if (delayTimeout) {clearTimeout(delayTimeout); delayTimeout = 0;}
         if (animData.leadingSilence && startAudio) {
+			// animation starts but audio is delayed, animating=true
+            //console.log("leading silence");
             delayTimeout = setTimeout(onDelayComplete, animData.leadingSilence);
             getItStartedActual(false);
         }
@@ -782,6 +1227,8 @@ function CharacterApiClient(divid, params) {
     }
 
     function getItStartedActual(startAudio) {
+        t4 = Date.now();
+        //if (t1) console.log("total time to start: "+(t4-t1));
         // start animation loop if needed
         if (!rafid) {
             rafid = requestAnimationFrame(animate);
@@ -789,15 +1236,30 @@ function CharacterApiClient(divid, params) {
             then = Date.now();
         }
         // start audio
-        if (startAudio) {
-            if (audioContext) {
+        if (startAudio && audioContext) {
+            // Normal
+            if (!streaming) {
                 try {
+                    // Start the single buffer
                     audioSource = audioContext.createBufferSource();
                     audioSource.buffer = audioBuffer;
                     audioSource.connect(gainNode);
                     gainNode.gain.value = 1;
                     audioSource.start();
-                } catch(e){}                    
+                } catch(e){}   
+            }
+            // Streaming
+            else {
+                //console.log("starting buffers");
+                // Start/schedule all accumulated buffers
+                gainNode.gain.value = 1;
+                var time = audioContext.currentTime;
+                for (var i = 0; i < streamingBuffers.length; i++) {
+                    streamingBuffers[i].time = time;
+                    streamingBuffers[i].node.start(time);
+                    time += streamingBuffers[i].duration;
+                }
+                streamingAudioStarted = true;
             }
         }
         starting = false;
@@ -808,6 +1270,20 @@ function CharacterApiClient(divid, params) {
     }
 
     function animate() {
+        if (streaming) {
+            if (streamingPaused) {
+				rafid = requestAnimationFrame(animate);
+				return;
+			}
+            // check that we still have audio (but typically we run out of frames before we run out of audio)
+            if (streamingAudioStarted && !streamingFinal && (streamingBuffers.length == 0 || streamingBuffers[streamingBuffers.length - 1].time + streamingBuffers[streamingBuffers.length - 1].duration < audioContext.currentTime)) {
+                streamingPaused = true;
+                console.warn("Character API animation paused for buffering audio");
+				rafid = requestAnimationFrame(animate);
+                return;
+            }
+        }
+
 		rafid = null;
 		now = Date.now();
         elapsed = now - then;
@@ -815,10 +1291,15 @@ function CharacterApiClient(divid, params) {
             rafid = requestAnimationFrame(animate);
             return;
         }
+        
+        try {
+            
         then = now - (elapsed % fpsInterval);
         var framesSkip = Math.max(1, Math.floor(elapsed / fpsInterval)) - 1;
         //if (framesSkip > 0) console.log("dropped "+framesSkip+" frame(s)");
         
+        //if (frame) console.log("frame: " + frame + (stopping ? " stopping" : "") + (streaming ? " streaming" : "") );
+
         var completed = undefined;
         var update = false;
         if (animData) {
@@ -835,11 +1316,19 @@ function CharacterApiClient(divid, params) {
                     completed = true;
                 }
                 else {
-                    if (frame === undefined) 
+                    if (frame === undefined) {
                         frame = 0;
+                        lastRealFrame = 0;
+                    }
                     else { 
+                        lastRealFrame = frame;
                         var frameNew = frame + 1 + framesSkip;
                         while (frame < frameNew) {
+                            if (!animData.frames[frame]) {  // We were asked to run a frame beyond our animData - should never happen
+                                console.error("Character API animation internal error"); 
+                                rafid = requestAnimationFrame(animate); 
+                                return;
+                            }
                             if (animData.frames[frame][1] == -1) break; // regardless, never move past -1 (end of animation) frame
                             if (stopping && animData.frames[frame][1]) break; // and when recovering, another recovery frame can occur
                             frame++;
@@ -850,7 +1339,6 @@ function CharacterApiClient(divid, params) {
             }
             
             if (update) {
-
                 var canvas = document.getElementById(divid + "-canvas");
                 var framerec = animData.frames[frame];
                 if (canvas) {
@@ -884,11 +1372,13 @@ function CharacterApiClient(divid, params) {
                                     src = texture;
                                 
                                 var process = recipe[i][7]||0;
+                                var key = process + '-' + recipe[i][4] + '-' + recipe[i][5];
+                                var keyEyeball = 5 + '-' + recipe[i][4] + '-' + recipe[i][5];
                                 var toosmall = animData.swayProcess == 2 /*body*/ && animData.density == 1;
                                 if (process >= 11 && process < 20) updateRandomWalk(process);
                                 if (process == 1 || process == 2 || (!toosmall && (process == 4 || process == 5))) {
                                     var o = updateTransform(src, recipe, i);
-                                    ctx.drawImage(canvasTransformDst[process-1],
+                                    ctx.drawImage(canvasTransformDst[key],
                                         0, 0,
                                         recipe[i][4], recipe[i][5],
                                         recipe[i][0] + o.x, recipe[i][1] + o.y,
@@ -899,9 +1389,9 @@ function CharacterApiClient(divid, params) {
                                 }
                                 else if (process == 4 && toosmall) {
                                     var o = updateTransform(src, recipe, i);
-                                    var ctx2 = canvasTransformDst[5-1].getContext("2d");
-                                    ctx2.drawImage(canvasTransformDst[4-1], 0, 0); // draw mask into eyeball
-                                    ctx.drawImage(canvasTransformDst[5-1],
+                                    var ctx2 = canvasTransformDst[keyEyeball].getContext("2d");
+                                    ctx2.drawImage(canvasTransformDst[key], 0, 0); // draw mask into eyeball
+                                    ctx.drawImage(canvasTransformDst[keyEyeball],
                                         0, 0,
                                         recipe[i][4], recipe[i][5],
                                         recipe[i][0] + o.x / 2, recipe[i][1] + o.y / 2,
@@ -927,6 +1417,10 @@ function CharacterApiClient(divid, params) {
                                         recipe[i][4], recipe[i][5],
                                         recipe[i][0], recipe[i][1],
                                         recipe[i][4], recipe[i][5]);
+                                }
+                                if (process == 1 && defaultTexture && src != defaultTexture) {
+                                    timeSinceLastMouthMovement = Date.now();
+                                    //console.log("mouth moving");
                                 }
                             }
                         }
@@ -955,44 +1449,88 @@ function CharacterApiClient(divid, params) {
             }
         }
 
+        } catch(e) {console.error(e);}
+
         if (completed) {
-            animating = false;
-            stopping = false;
-            frame = undefined;
-            animateComplete();
+			// Case where we completed early because we ran to the end of the animation plan but this is not the final call
+	        if (streaming && streamingAudioStarted && !streamingFinal) {
+				streamingPaused = true;
+                frame = lastRealFrame;
+                streamingFramesWhenPaused = animData.frames.length; // this helps us decide when conditions have improved
+				console.warn("Character API animation paused for buffering animation");
+                pauseStreamingAudio();
+				rafid = requestAnimationFrame(animate);
+                return;
+	        }
+			// Normal case
+			else {
+	            animating = false;
+                idling = false;
+	            stopping = false;
+	            frame = undefined;
+	            animateComplete();
+			}
         }
         
         rafid = requestAnimationFrame(animate);
     }
 
     function stopAll() {
-        if (audioContext) {
+        //console.log("stopAll");
+        cancelAnyLoads();
+        // Ramp down the volume
+        if (audioSource) {
             if (gainNode) gainNode.gain.setTargetAtTime(0, audioContext.currentTime, 0.015);
-            timeSinceLastAudioStopped = Date.now();
         }
-        if (loading || animating)
+        // If this is a streaming call then there is extra to clean up.
+        if (streaming) { 
+            // stop all buffers
+            for (var i = 0; i < streamingBuffers.length; i++) {
+                if (streamingBuffers[i].time)
+                    streamingBuffers[i].node.stop();
+            }
+            var temp = streamingAfterAbortedIdle;
+			resetStreaming();
+            streamingAfterAbortedIdle = temp;
+        }
+        // Smooth-stop the animation
+        if (animating) {
             stopping = true;
+            //executeCallback = onIdleComplete;
+        }
+        loading = false;
+        idling = false; // This only indicates truly idling, not stopping idle
+        // Special case where we haven't actually started - skip stopping phase
+        var recover = false;
         if (delayTimeout) {
             clearTimeout(delayTimeout);
             delayTimeout = 0;
+            recover = true;
         }
         if (settleTimeout) {
             clearTimeout(settleTimeout);
             settleTimeout = 0;
+            recover = true;
+        }
+        if (recover) {
             animating = false;
+            stopping = false;
             animateComplete();
         }
     }
 
     function animateFailed() {
+        cancelAnyLoads();
         loading = false;
         loadPhase = 3;
+        stopping = false;
         animateComplete();
     }
 
     function animateComplete() {
         timeSinceLastAction = 0;  // used in checkIdle
 
+        // First appearance
         if (!loaded) {
             loaded = true;
 
@@ -1004,11 +1542,8 @@ function CharacterApiClient(divid, params) {
 
             characterLoaded();
         }
+        // Normal case
         else {
-            if (audioSource) {
-                // Audio can overhang animation in some cases
-                timeSinceLastAudioStopped = Date.now();
-            }
             if (params.saveState && animData) initialState = animData.finalState;
             if (executeCallback) {
                 var t = executeCallback;
@@ -1106,28 +1641,33 @@ function CharacterApiClient(divid, params) {
             addXForm(1, 0, 0, 1, -x, -y, m);
         }
         // Extract the portion of the image we want to a new temp context and get its bits as the source
-        if (!canvasTransformSrc[process-1]) {
-            canvasTransformSrc[process-1] = document.createElement('canvas');
-            canvasTransformSrc[process-1].width = width;
-            canvasTransformSrc[process-1].height = height;
+        var key = process + '-' + width + '-' + height;
+        if (!canvasTransformSrc[key]) {
+            canvasTransformSrc[key] = document.createElement('canvas');
+            canvasTransformSrc[key].width = width;
+            canvasTransformSrc[key].height = height;
         }
-        canvasTransformSrc[process-1].getContext('2d', {willReadFrequently:true}).clearRect(0, 0, width, height);
-        canvasTransformSrc[process-1].getContext('2d', {willReadFrequently:true}).drawImage(src, recipe[i][2], recipe[i][3], width, height, 0, 0, width, height);
-        var source = canvasTransformSrc[process-1].getContext('2d', {willReadFrequently:true}).getImageData(0, 0, width, height);
+        canvasTransformSrc[key].getContext('2d', {willReadFrequently:true}).clearRect(0, 0, width, height);
+        canvasTransformSrc[key].getContext('2d', {willReadFrequently:true}).drawImage(src, recipe[i][2], recipe[i][3], width, height, 0, 0, width, height);
+        var source = canvasTransformSrc[key].getContext('2d', {willReadFrequently:true}).getImageData(0, 0, width, height);
         // Get the bits for a same-size region
-        if (!canvasTransformDst[process-1]) {
-            canvasTransformDst[process-1] = document.createElement('canvas');
-            canvasTransformDst[process-1].width = width;
-            canvasTransformDst[process-1].height = height;
+        if (!canvasTransformDst[key]) {
+            canvasTransformDst[key] = document.createElement('canvas');
+            canvasTransformDst[key].width = width;
+            canvasTransformDst[key].height = height;
         }
-        var target = canvasTransformSrc[process-1].getContext('2d', {willReadFrequently:true}).createImageData(width, height);
+        var target = canvasTransformSrc[key].getContext('2d', {willReadFrequently:true}).createImageData(width, height);
         // Return the image displacement
         var deltax = 0;
         var deltay = 0;
         if (process == 1 || process == 4 || process == 5) {
             // Assume same size for destination image as for src, and compute where the origin will fall
-            var xDstImage = Math.round(xSrcImage + rt * Math.sin(twist));
-            var yDstImage = Math.round(ySrcImage - rb * Math.sin(bend));
+            var xDstImage = xSrcImage + rt * Math.sin(twist);
+            var yDstImage = ySrcImage - rb * Math.sin(bend);
+			xDstImage -= sideLength * Math.sin(side);
+			yDstImage -= sideLength * Math.cos(side) - sideLength;
+            xDstImage = Math.round(xDstImage);
+            yDstImage = Math.round(yDstImage);
             deltax = xDstImage - xSrcImage;
             deltay = yDstImage - ySrcImage;
             deltax = Math.floor(deltax * 0.6); // a fudge factor to compensate for shift in mouth/eye within moving overlay
@@ -1215,37 +1755,27 @@ function CharacterApiClient(divid, params) {
                     target.data[offDst] = alpha/*/2*/; offDst++;
                 }
             }
-            if (process == 4) { // eyemask - also convolve the alpha on the eye cutout for more natural shadow
-                var temp = new Uint8ClampedArray(target.data);
-                var conv = animData.density;
+            if (process == 5) { // eyeball - also apply a more natural shadow
+                var xPupil = 0;
+                var yPupil = height*0.1;
                 var offDst = 0;
                 for (var yDst = 0; yDst < height; yDst++) {
-					var s = "";
                     for (var xDst = 0; xDst < width; xDst++) {
+                        var xAdj;
                         if (xDst <= width/2)
-                            v = (xDst-aeye)*(xDst-aeye)/(aeye*aeye) + (yDst-beye)*(yDst-beye)/(beye*beye);
+                            xAdj = xDst - width/4;
                         else 
-                            v = ((xDst-width/2)-aeye)*((xDst-width/2)-aeye)/(aeye*aeye) + (yDst-beye)*(yDst-beye)/(beye*beye);
-                        if (v < vpeye) {
-                            aint = target.data[offDst+3];
-                            if (aint < 200) {
-                                var n = 0;
-                                var t = 0;
-                                for (var yRun = -conv; yRun < conv; yRun++) {
-                                    for (var xRun = -conv; xRun < conv; xRun++) {
-                                        var off = offDst + yRun*width*4 + xRun*4;
-                                        t += target.data[off + 3];
-                                        n++;
-                                    }
-                                }
-                                alpha = Math.max(aint, Math.round(Math.min(t/n, 200) * 0.75));
-                                temp[offDst+3] = alpha; 
-                            }
-                        }
-                        offDst += 4;
+                            xAdj = xDst - width/2 - width/4;
+                        var yAdj = yDst - height/2;
+                        var dPupil = Math.sqrt((xAdj-xPupil)*(xAdj-xPupil) + (yAdj-yPupil)*(yAdj-yPupil));
+						var dPupilMin = 3*animData.density;
+                        var f = dPupil < dPupilMin ? 1 : 1 - ((dPupil-dPupilMin) / (height*0.3));
+                        target.data[offDst] = Math.round(target.data[offDst] * f); offDst++;
+                        target.data[offDst] = Math.round(target.data[offDst] * f); offDst++;
+                        target.data[offDst] = Math.round(target.data[offDst] * f); offDst++;
+                        offDst++;
                     }
                 }
-                target.data.set(temp);
             }
         }
         else if (process == 2) { //  jaw
@@ -1285,7 +1815,7 @@ function CharacterApiClient(divid, params) {
                 }
             }
         }
-        canvasTransformDst[process-1].getContext('2d').putImageData(target, 0, 0);
+        canvasTransformDst[key].getContext('2d').putImageData(target, 0, 0);
         return {x:deltax, y:deltay};
     }
     
@@ -1422,7 +1952,7 @@ function CharacterApiClient(divid, params) {
             return a;
         }
         else {
-            console.error("missing idleData");
+            console.error("Character API missing idleData");
             return [];
         }
     }
@@ -1443,7 +1973,7 @@ function CharacterApiClient(divid, params) {
         timeSinceLastAction += elapsed;
         timeSinceLastBlink += elapsed;
 
-        if (loaded && !loading && !animating && !playShield && loadPhase != 3) {
+        if (loaded && !loading && !streaming && !animating && !playShield && loadPhase != 3 && !attention) {
             if (timeSinceLastAction > 1500 + Math.random() * 3500) {  // no more than 5 seconds with no action whatsoever
                 timeSinceLastAction = 0;
                 var idles = getIdles();
@@ -1451,7 +1981,7 @@ function CharacterApiClient(divid, params) {
                 // There WILL be an action - will it be a blink? Blinks must occur at a certain frequency. But hd characters incorporate blink into idle actions.
                 if (hasBlinkIdle && timeSinceLastBlink > 5000 + Math.random() * 5000) {
                     timeSinceLastBlink = 0;
-                    execute("blink", "", null, null, true, onIdleComplete.bind(null));
+                    execute("blink", "", null, null, true, onIdleComplete);
                 }
                 // Or another idle routine?
                 else {
@@ -1472,7 +2002,9 @@ function CharacterApiClient(divid, params) {
                     }
                     if (idle) {
                         lastIdle = idle;
-                        execute(idle, "", null, null, true, onIdleComplete.bind(null));
+                        //console.log("idle");
+                        t1 = Date.now();
+                        execute(idle, "", null, null, true, onIdleComplete);
                     }
                 }
             }
@@ -1498,6 +2030,7 @@ function CharacterApiClient(divid, params) {
         rafid = null;
         var div = document.getElementById(divid);
         if (div) div.innerHTML = "";
+        cancelAnyLoads();
         resetInnerVars();
         resetOuterVars();
     }

@@ -468,8 +468,11 @@ function CharacterApiClient(divid, params) {
             // Complete the transition to new execute
             executeCallback = executeCallbackNext;
             executeCallbackNext = null;
-            getItStarted(!!audioBuffer);
-            return;
+            if (animDataNext) {
+                getItStarted(!!audioBuffer);
+                return;
+            }
+            if (loading) return;
         }
         if (playQueue.length > 0) {
             playCur = playQueue.shift();
@@ -478,8 +481,8 @@ function CharacterApiClient(divid, params) {
             execute(playCur.do, playCur.say, playCur.audio, playCur.lipsync, false, onPlayDone);
         }
         else {
-            if (playCur) {
-                playCur = null;
+            playCur = null;
+            if (!loading) {
                 document.getElementById(divid).dispatchEvent(createEvent("playComplete")); // i.e. all plays complete - we are idle
             }
         }
@@ -509,7 +512,10 @@ function CharacterApiClient(divid, params) {
             // Complete the transition to new execute
             executeCallback = executeCallbackNext;
             executeCallbackNext = null;
-            getItStarted(!!audioBuffer);
+            if (animDataNext) {
+                getItStarted(!!audioBuffer);
+            }
+            // else: a subsequent execute is still loading or was cancelled;
         }
         else if (streamingAfterAbortedIdle) {
             streamingAfterAbortedIdle = false;
@@ -526,11 +532,11 @@ function CharacterApiClient(divid, params) {
     this.stop = function() {
         stopAll();
         playQueue = [];
+        playCur = null;
     }
 
     this.attention = function() {
-        stopAll();
-        playQueue = [];
+        that.stop();
         attention = true;
     }
     this.clearAttention = function() {
@@ -1047,6 +1053,12 @@ function CharacterApiClient(divid, params) {
                 loadedWhileStopping = true;
             }
             else {
+                // If the stopping animation finished before this load completed, executeCallbackNext
+                // was never transferred to executeCallback. Transfer it now so the callback fires.
+                if (executeCallbackNext && !executeCallback) {
+                    executeCallback = executeCallbackNext;
+                    executeCallbackNext = null;
+                }                
                 getItStarted(!!audioBuffer);
             }
         }
@@ -2301,6 +2313,3 @@ function CharacterApiClient(divid, params) {
 
     start();
 }
-
-
-

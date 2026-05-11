@@ -27,7 +27,7 @@ import CharacterApiClient from './node_modules/@mediasemantics/character-api-cli
 var character;
 document.addEventListener("DOMContentLoaded", function() {
     character = CharacterApiClient.setupDiv("myDiv", {
-        character: "SusanHead",
+        character: "MichelleHead",
         animateEndpoint: "http://localhost:3000/animate", 
         catalogEndpoint: "http://localhost:3000/catalog"
     });
@@ -43,11 +43,13 @@ a very similar API.
 
 The character works like a puppet. Without any input, it exhibits an "idle" behavior. 
 You can prompt it to say different things by invoking the `dynamicPlay()` function.
-Each call to dynamicPlay consists of one line - typically a sentence. A line takes the form of a do/say pair representing a string to be spoken and a manner in which to speak it. You can also use a `do` by itself to perform a silent action, or a `say` by itself to speak with no deliberate action.
+Each call to dynamicPlay consists of one line, typically a sentence. A line takes the form of a do/say pair representing a string to be spoken and a manner in which to speak it. You can also use a `do` by itself to perform a silent action, or a `say` by itself to speak with no deliberate action.
 
 ```
 character.dynamicPlay({do:'look-right', say:'Look over here.'})
 ```
+
+In addition to lip movements, the Character API adds other subtle animation, such as head movement, eye blinks, etc. This action has a random component, however the randomness is seeded based on the contents of the text to be spoken. This means that the exact same text will always result in the same animation, which allows for efficient caching at multiple levels, including in the browser, at a CDN or edge cache, and at the server.
 
 You can use the `stop()` method to smoothly stop any ongoing play. It's a good idea to do this before a `dynamicPlay()` if you want to interrupt any lines that may be playing:
 
@@ -96,7 +98,7 @@ function speakParagraph(paragraph) {
 }
 ```
 
-Breaking the paragaph down into sentences is necessary in order to lower the latency and to avoid limits on the length of the "say" field.
+Breaking the paragaph down into sentences is necessary in order to lower the latency and to avoid a built-in limit on the length of the "say" field of 255 characters.
 
 ## Preloading lines
 
